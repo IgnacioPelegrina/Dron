@@ -1,0 +1,691 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <math.h>
+#include "driver/ledc.h"
+#include <Adafruit_VL53L0X.h>
+
+// ================================================================
+// DRON ESP32-S3 + CONTROL DESDE TELEFONO POR WI-FI
+// ================================================================
+//
+// Arquitectura:
+//   TELEFONO --Wi-Fi/WebSocket--> ESP32-S3 --> control de vuelo --> 4 motores
+//
+// El ESP32-S3 crea su propia red Wi-Fi (SoftAP).
+// El telefono se conecta a esa red y la app abre:
+//   ws://192.168.4.1:81
+//
+// PROTOCOLO DE COMANDO (texto CSV):
+//   CMD,joy1_x,joy1_y,joy2_x,joy2_y,btn1,btn2
+//
+// Donde:
+//   joy1_x : throttle, 0..4095 (centro 2048)
+//   joy1_y : yaw,       0..4095 (centro 2048)
+//   joy2_x : pitch,     0..4095 (centro 2048)
+//   joy2_y : roll,      0..4095 (centro 2048)
+//   btn1   : 1 = desarmar
+//   btn2   : 1 = armar
+//
+// Ejemplo:
+//   CMD,2048,2048,2048,2048,0,1
+//
+// TELEMETRIA (ESP32-S3 -> app):
+//   TEL,roll,pitch,motorBase,m1,m2,m3,m4,manPitch,manRoll,manYaw,yaw,gyroZ,distance,armed,failsafe
+//
+// IMPORTANTE:
+//   Antes de conectar helices/hardware real, probar motores SIN HELICES.
+//   El enlace Wi-Fi tiene un failsafe: si no llegan comandos durante
+//   COMMAND_TIMEOUT_MS, se corta el throttle y se solicita aterrizaje.
+// ================================================================
+
+// =================== CONFIGURACION ===================
+const char* WIFI_SSID = "DRON_S3";
+const char* WIFI_PASS = "12345678";   // minimo 8 caracteres
+const uint8_t WIFI_CHANNEL = 6;
+
+const uint16_t WS_PORT = 81;
+const uint32_t COMMAND_TIMEOUT_MS = 300;  // failsafe por perdida de enlace
+const uint32_t TELEMETRY_INTERVAL_MS = 50; // 20 Hz
+
+const int PWM_FREQ = 8000;
+const ledc_timer_bit_t PWM_RES = LEDC_TIMER_8_BIT;
+const int PWM_MAX = 255;
+
+// =================== MOTORES ===================
+const int PIN_M1 = 21;  // delantero izq
+const int PIN_M2 = 9;   // delantero der
+const int PIN_M3 = 4;   // trasero der
+const int PIN_M4 = 1;   // trasero izq
+
+// Canales LEDC
+const ledc_channel_t CH_M1 = LEDC_CHANNEL_0;
+const ledc_channel_t CH_M2 = LEDC_CHANNEL_1;
+const ledc_channel_t CH_M3 = LEDC_CHANNEL_2;
+const ledc_channel_t CH_M4 = LEDC_CHANNEL_3;
+
+// Timer LEDC
+const ledc_timer_t LEDC_TIMER = LEDC_TIMER_0;
+const ledc_mode_t LEDC_MODE = LEDC_LOW_SPEED_MODE;
+
+// =================== CONTROL ===================
+int MOTOR_IDLE = 150;
+const int HEADROOM = 40;
+
+float Kp_pitch = 3.0f;
+float Kd_pitch = 0.5f;
+float Kp_roll  = 3.0f;
+float Kd_roll  = 0.5f;
+float Kp_yaw   = 0.5f;
+
+/*
+// Anular PD para pruebas
+float Kp_pitch = 0.0f;
+float Kd_pitch = 0.0f;
+float Kp_roll  = 0.0f;
+float Kd_roll  = 0.0f;
+float Kp_yaw   = 0.0f;
+*/
+
+float manualPitchCmd = 0;
+float manualRollCmd  = 0;
+float manualYawCmd   = 0;
+
+// Filtro complementario
+const float ALPHA = 0.99f;
+
+// Orientacion del MPU
+const int ROLL_SIGN  = +1;
+const int PITCH_SIGN = +1;
+
+// =================== I2C / SENSORES ===================
+#define I2C_SDA 7
+#define I2C_SCL 6
+
+Adafruit_MPU6050 mpu;
+Adafruit_VL53L0X lox;
+
+uint16_t dist_mm = 0xFFFF;
+bool Aterrizar = false;
+
+// =================== WIFI / WEBSOCKET ===================
+WebServer httpServer(80);
+WebSocketsServer webSocket(WS_PORT);
+
+volatile bool wsConnected = false;
+uint8_t wsClientNum = 0;
+unsigned long lastCommandMs = 0;
+bool failsafeActive = false;
+
+// =================== DATOS DE CONTROL ===================
+typedef struct {
+  int joy1_x;  // throttle 0..4095
+  int joy1_y;  // yaw      0..4095
+  int joy2_x;  // pitch    0..4095
+  int joy2_y;  // roll     0..4095
+  bool btn1;   // desarmar
+  bool btn2;   // armar
+} ControlData;
+
+ControlData data = {2048, 2048, 2048, 2048, false, false};
+bool ActivarMotor = false;
+int baseCmd = 0;
+
+// =================== ESTADO ===================
+float roll_f = 0, pitch_f = 0, yaw_f = 0;
+float gyroZ_corr = 0;
+unsigned long lastTime = 0;
+
+float alt_target = 300.0f;
+
+// Para control de altura
+bool airborne = false;
+
+// =================== UTILES PWM ===================
+static inline void setMotor(ledc_channel_t ch, int duty) {
+  duty = constrain(duty, 0, PWM_MAX);
+  ledc_set_duty(LEDC_MODE, ch, duty);
+  ledc_update_duty(LEDC_MODE, ch);
+}
+
+static void stopAllMotors() {
+  setMotor(CH_M1, 0);
+  setMotor(CH_M2, 0);
+  setMotor(CH_M3, 0);
+  setMotor(CH_M4, 0);
+}
+
+static void setupPWM() {
+  ledc_timer_config_t timer = {};
+  timer.speed_mode      = LEDC_MODE;
+  timer.timer_num       = LEDC_TIMER;
+  timer.duty_resolution = PWM_RES;
+  timer.freq_hz         = PWM_FREQ;
+  timer.clk_cfg         = LEDC_AUTO_CLK;
+  ledc_timer_config(&timer);
+
+  auto attachChannel = [](int pin, ledc_channel_t ch) {
+    ledc_channel_config_t c = {};
+    c.gpio_num   = (gpio_num_t)pin;
+    c.speed_mode = LEDC_MODE;
+    c.channel    = ch;
+    c.intr_type  = LEDC_INTR_DISABLE;
+    c.timer_sel  = LEDC_TIMER;
+    c.duty       = 0;
+    c.hpoint     = 0;
+    ledc_channel_config(&c);
+  };
+
+  attachChannel(PIN_M1, CH_M1);
+  attachChannel(PIN_M2, CH_M2);
+  attachChannel(PIN_M3, CH_M3);
+  attachChannel(PIN_M4, CH_M4);
+}
+
+// =================== WIFI / HTTP ===================
+void setupWiFi() {
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);  // reduce latencia/jitter del enlace
+
+  IPAddress local_ip(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.softAPConfig(local_ip, gateway, subnet);
+
+  bool ok = WiFi.softAP(WIFI_SSID, WIFI_PASS, WIFI_CHANNEL, false, 1);
+  if (!ok) {
+    Serial.println("ERROR creando SoftAP");
+    while (true) delay(1000);
+  }
+
+  IPAddress ip = WiFi.softAPIP();
+  Serial.println("Wi-Fi listo");
+  Serial.print("SSID: ");
+  Serial.println(WIFI_SSID);
+  Serial.print("IP: ");
+  Serial.println(ip);
+  Serial.print("WebSocket: ws://");
+  Serial.print(ip);
+  Serial.print(":");
+  Serial.println(WS_PORT);
+}
+
+void setupHttpServer() {
+  httpServer.on("/", HTTP_GET, []() {
+    String html =
+      "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>DRON S3</title></head><body>"
+      "<h2>ESP32-S3 DRON</h2>"
+      "<p>Wi-Fi OK</p>"
+      "<p>WebSocket: ws://192.168.4.1:81</p>"
+      "<p>App: enviar CMD,joy1_x,joy1_y,joy2_x,joy2_y,btn1,btn2</p>"
+      "</body></html>";
+    httpServer.send(200, "text/html", html);
+  });
+
+  httpServer.on("/status", HTTP_GET, []() {
+    String json = "{\"armed\":" + String(ActivarMotor ? "true" : "false") +
+                  ",\"failsafe\":" + String(failsafeActive ? "true" : "false") +
+                  ",\"distance_mm\":" + String(dist_mm) + "}";
+    httpServer.send(200, "application/json", json);
+  });
+
+  httpServer.begin();
+}
+
+// =================== PARSER COMANDO ===================
+// Espera exactamente:
+// CMD,joy1_x,joy1_y,joy2_x,joy2_y,btn1,btn2
+bool parseControlMessage(uint8_t* payload, size_t length, ControlData& out) {
+  if (length == 0 || length >= 200) return false;
+
+  char buf[200];
+  memcpy(buf, payload, length);
+  buf[length] = '\0';
+
+  char* saveptr = nullptr;
+  char* token = strtok_r(buf, ",", &saveptr);
+  if (!token || strcmp(token, "CMD") != 0) return false;
+
+  char* fields[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+  for (int i = 0; i < 6; i++) {
+    fields[i] = strtok_r(nullptr, ",", &saveptr);
+    if (!fields[i]) return false;
+  }
+
+  out.joy1_x = constrain(atoi(fields[0]), 0, 4095);
+  out.joy1_y = constrain(atoi(fields[1]), 0, 4095);
+  out.joy2_x = constrain(atoi(fields[2]), 0, 4095);
+  out.joy2_y = constrain(atoi(fields[3]), 0, 4095);
+  out.btn1 = atoi(fields[4]) != 0;
+  out.btn2 = atoi(fields[5]) != 0;
+
+  return true;
+}
+
+// =================== PROCESAMIENTO DEL MANDO ===================
+void applyControlCommand(const ControlData& incoming) {
+  // Throttle: centro = 0, solamente parte positiva
+  int joyX = incoming.joy1_x - 2048;
+  if (abs(joyX) < 100) joyX = 0;
+
+  if ((joyX > 0) && (dist_mm < 300)) {
+    int rawThrottle = map(joyX, 0, 2047, 0, 255);
+    baseCmd = map(rawThrottle, 150, 255, 0, PWM_MAX - MOTOR_IDLE - HEADROOM);
+  } else {
+    baseCmd = 0;
+  }
+
+  baseCmd = constrain(baseCmd, 0, PWM_MAX - MOTOR_IDLE - HEADROOM);
+
+  if (joyX < 0) {
+    Aterrizar = true;
+  }
+
+  // Botones por flanco: evita rearmar/desarmar en cada paquete mientras se mantiene pulsado.
+  bool disarmEdge = incoming.btn1 && !data.btn1;
+  bool armEdge = incoming.btn2 && !data.btn2;
+
+  if (disarmEdge) {
+    ActivarMotor = false;
+    airborne = false;
+    baseCmd = 0;
+    manualPitchCmd = 0;
+    manualRollCmd = 0;
+    manualYawCmd = 0;
+    MOTOR_IDLE = 150;
+    Aterrizar = false;
+  }
+
+  if (armEdge) {
+    // Solo se permite volver a armar cuando el comando esta llegando.
+    ActivarMotor = true;
+    roll_f = 0.0f;
+    pitch_f = 0.0f;
+    yaw_f = 0.0f;
+    MOTOR_IDLE = 150;
+    Aterrizar = false;
+    airborne = false;
+  }
+
+  // Entrada manual pitch/roll/yaw
+  int joyY2 = incoming.joy2_y - 2048; // izquierda/derecha -> roll
+  int joyX2 = incoming.joy2_x - 2048; // adelante/atras   -> pitch
+  int joyY1 = incoming.joy1_y - 2048; // yaw
+
+  if (abs(joyY2) < 400) joyY2 = 0;
+  if (abs(joyX2) < 400) joyX2 = 0;
+  if (abs(joyY1) < 400) joyY1 = 0;
+
+  manualPitchCmd = map(joyX2, -2048, 2047, 10, -10);
+  manualRollCmd  = map(joyY2, -2048, 2047, 10, -10);
+  manualYawCmd   = map(joyY1, -2048, 2047, 20, -20);
+
+  data = incoming;
+  lastCommandMs = millis();
+  failsafeActive = false;
+}
+
+// =================== WEBSOCKET CALLBACK ===================
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED: {
+      wsClientNum = num;
+      wsConnected = true;
+      lastCommandMs = millis();
+      failsafeActive = false;
+
+      Serial.printf("WS cliente %u conectado\n", num);
+      webSocket.sendTXT(num, "READY,DRON_S3");
+      break;
+    }
+
+    case WStype_DISCONNECTED:
+      if (num == wsClientNum) {
+        wsConnected = false;
+        Serial.printf("WS cliente %u desconectado\n", num);
+
+        if (ActivarMotor) {
+          // Failsafe: pierde enlace -> deja throttle a cero y solicita aterrizaje.
+          baseCmd = 0;
+          manualPitchCmd = 0;
+          manualRollCmd = 0;
+          manualYawCmd = 0;
+          Aterrizar = true;
+          failsafeActive = true;
+        }
+      }
+      break;
+
+    case WStype_TEXT: {
+      ControlData incoming;
+      if (parseControlMessage(payload, length, incoming)) {
+        applyControlCommand(incoming);
+      } else {
+        Serial.print("CMD invalido: ");
+        for (size_t i = 0; i < length; i++) Serial.print((char)payload[i]);
+        Serial.println();
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+// =================== SETUP ===================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);
+
+  if (!mpu.begin(0x68)) {
+    Serial.println("MPU6050 no detectado!");
+    while (1) delay(100);
+  }
+
+  if (!lox.begin(0x29, &Wire)) {
+    Serial.println("VL53L0X FAIL");
+    while (1) delay(100);
+  }
+
+  lox.setMeasurementTimingBudgetMicroSeconds(20000);
+
+  setupPWM();
+  stopAllMotors();
+
+  setupWiFi();
+  setupHttpServer();
+
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+
+  Serial.println("Inicio OK");
+  lastTime = micros();
+  lastCommandMs = millis();
+}
+
+// =================== LOOP ===================
+void loop() {
+  httpServer.handleClient();
+  webSocket.loop();
+
+  // ------------------------------------------------------------
+  // FAILSAFE DE COMUNICACION
+  // ------------------------------------------------------------
+  if (ActivarMotor && (millis() - lastCommandMs > COMMAND_TIMEOUT_MS)) {
+    if (!failsafeActive) {
+      Serial.println("!!! FAILSAFE: perdida de Wi-Fi/comandos !!!");
+    }
+
+    baseCmd = 0;
+    manualPitchCmd = 0;
+    manualRollCmd = 0;
+    manualYawCmd = 0;
+    Aterrizar = true;
+    failsafeActive = true;
+  }
+
+  // ------------------------------------------------------------
+  // VL53L0X
+  // ------------------------------------------------------------
+  static unsigned long lastVL = 0;
+
+  if (millis() - lastVL > 100) {
+    VL53L0X_RangingMeasurementData_t m;
+    lox.rangingTest(&m, false);
+
+    if (m.RangeStatus != 4) {
+      dist_mm = m.RangeMilliMeter;
+    } else {
+      dist_mm = 0xFFFF;
+    }
+
+    lastVL = millis();
+  }
+
+  // ------------------------------------------------------------
+  // IMU
+  // ------------------------------------------------------------
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  float ax = a.acceleration.x;
+  float ay = a.acceleration.y;
+  float az = a.acceleration.z;
+
+  float accRoll  = atan2(ay, az) * 180.0f / PI;
+  float accPitch = atan2(-ax, sqrtf(ay * ay + az * az)) * 180.0f / PI;
+
+  // Ceros originales
+  accPitch -= 0.5f;
+  accRoll  += 1.9f;
+
+  unsigned long now = micros();
+  float dt = (now - lastTime) / 1000000.0f;
+  if (dt <= 0) dt = 0.001f;
+  lastTime = now;
+
+  float gyroX = g.gyro.x * 180.0f / PI;
+  float gyroY = g.gyro.y * 180.0f / PI;
+  float gyroZ = g.gyro.z * 180.0f / PI;
+
+  float a_total = sqrt(ax * ax + ay * ay + az * az);
+  bool acc_ok = (a_total > 7.0f && a_total < 12.0f) &&
+                (abs(accRoll) < 30.0f && abs(accPitch) < 30.0f);
+
+  if (acc_ok) {
+    roll_f  = ALPHA * (roll_f  + (ROLL_SIGN  * gyroX) * dt) + (1 - ALPHA) * (ROLL_SIGN  * accRoll);
+    pitch_f = ALPHA * (pitch_f + (PITCH_SIGN * gyroY) * dt) + (1 - ALPHA) * (PITCH_SIGN * accPitch);
+  } else {
+    roll_f  += (ROLL_SIGN  * gyroX) * dt;
+    pitch_f += (PITCH_SIGN * gyroY) * dt;
+  }
+
+  // ------------------------------------------------------------
+  // TRIMS / YAW
+  // ------------------------------------------------------------
+  float roll_trim = 3.0f;
+  float pitch_trim = -3.0f;
+  float gyro_bias_z = -1.11f;
+
+  gyroZ_corr = gyroZ - gyro_bias_z;
+  yaw_f += gyroZ_corr * dt;
+  if (yaw_f > 180) yaw_f -= 360;
+  if (yaw_f < -180) yaw_f += 360;
+
+  float roll_corr  = (roll_f - manualRollCmd - roll_trim) * Kp_roll + (ROLL_SIGN * gyroX) * Kd_roll;
+  float pitch_corr = (pitch_f - manualPitchCmd - pitch_trim) * Kp_pitch + (PITCH_SIGN * gyroY) * Kd_pitch;
+  float yaw_corr   = (manualYawCmd - gyroZ_corr) * Kp_yaw;
+
+  // ------------------------------------------------------------
+  // AIRBORNE
+  // ------------------------------------------------------------
+  if (ActivarMotor) {
+    if (!airborne && dist_mm > 60 && dist_mm < 4000) {
+      airborne = true;
+      Serial.println("DRON en el aire");
+    }
+  }
+
+  // ------------------------------------------------------------
+  // CONTROL DE ALTURA
+  // ------------------------------------------------------------
+  static uint16_t last_dist = 0;
+  static unsigned long last_h_time = 0;
+  float v_z = 0;
+
+  float Kp_alt = 0.05f;
+  float Kd_alt = 20.0f;
+  float max_correction = 50;
+
+  unsigned long now_h = millis();
+  float dt_h = (now_h - last_h_time) / 1000.0f;
+
+  if (dt_h > 0 && dist_mm != 0xFFFF && last_dist != 0xFFFF) {
+    v_z = (dist_mm - last_dist) / dt_h;
+  }
+
+  last_dist = dist_mm;
+  last_h_time = now_h;
+
+  if (airborne && dist_mm != 0xFFFF) {
+    float error_alt = alt_target - dist_mm;
+    float correction = (error_alt * Kp_alt) - (v_z * Kd_alt);
+    correction = constrain(correction, -max_correction, max_correction);
+
+    MOTOR_IDLE = 150 + (int)correction;
+
+    if (dist_mm > 500) {
+      alt_target = 500.0f;
+    }
+
+    MOTOR_IDLE = constrain(MOTOR_IDLE, 130, 180);
+
+    if ((dist_mm - alt_target) > 600) {
+      Aterrizar = true;
+    }
+  }
+
+  // ------------------------------------------------------------
+  // ATERRIZAJE
+  // ------------------------------------------------------------
+  if (Aterrizar) {
+    if (dist_mm < 60 && dist_mm != 0xFFFF) {
+      ActivarMotor = false;
+      airborne = false;
+      baseCmd = 0;
+      MOTOR_IDLE = 150;
+      Serial.println("Aterrizaje automatico");
+    } else {
+      MOTOR_IDLE = 80;
+    }
+  }
+
+  // ------------------------------------------------------------
+  // BASE THROTTLE
+  // ------------------------------------------------------------
+  int motorBase = 0;
+  int minClamp = 0;
+
+  if (ActivarMotor) {
+    minClamp = MOTOR_IDLE;
+    motorBase = MOTOR_IDLE + baseCmd;
+    motorBase = constrain(motorBase, MOTOR_IDLE, PWM_MAX - HEADROOM);
+  }
+
+  // ------------------------------------------------------------
+  // CALIBRACION INDIVIDUAL DE MOTORES
+  // ------------------------------------------------------------
+  float m1_call = 52;
+  float m2_call = 4;
+  float m3_call = -52;
+  float m4_call = -4;
+
+  /*
+  float m1_call = 0;
+  float m2_call = 0;
+  float m3_call = 0;
+  float m4_call = 0;
+  */
+
+  // ------------------------------------------------------------
+  // MEZCLA X
+  // ------------------------------------------------------------
+  float m1 = motorBase - pitch_corr + roll_corr - yaw_corr + m1_call;
+  float m2 = motorBase - pitch_corr - roll_corr + yaw_corr + m2_call;
+  float m3 = motorBase + pitch_corr - roll_corr - yaw_corr + m3_call;
+  float m4 = motorBase + pitch_corr + roll_corr + yaw_corr + m4_call;
+
+  // ------------------------------------------------------------
+  // DESATURACION POR COLECTIVO
+  // ------------------------------------------------------------
+  float maxOut = fmaxf(fmaxf(m1, m2), fmaxf(m3, m4));
+  if (maxOut > PWM_MAX) {
+    float shiftDown = maxOut - PWM_MAX;
+    m1 -= shiftDown;
+    m2 -= shiftDown;
+    m3 -= shiftDown;
+    m4 -= shiftDown;
+  }
+
+  float minOut = fminf(fminf(m1, m2), fminf(m3, m4));
+  if (minOut < minClamp) {
+    float shiftUp = minClamp - minOut;
+    m1 += shiftUp;
+    m2 += shiftUp;
+    m3 += shiftUp;
+    m4 += shiftUp;
+
+    maxOut = fmaxf(fmaxf(m1, m2), fmaxf(m3, m4));
+    if (maxOut > PWM_MAX) {
+      float shiftDown = maxOut - PWM_MAX;
+      m1 -= shiftDown;
+      m2 -= shiftDown;
+      m3 -= shiftDown;
+      m4 -= shiftDown;
+    }
+  }
+
+  // ------------------------------------------------------------
+  // SALIDAS
+  // ------------------------------------------------------------
+  int out1 = constrain((int)lroundf(m1), 0, PWM_MAX);
+  int out2 = constrain((int)lroundf(m2), 0, PWM_MAX);
+  int out3 = constrain((int)lroundf(m3), 0, PWM_MAX);
+  int out4 = constrain((int)lroundf(m4), 0, PWM_MAX);
+
+  if (ActivarMotor) {
+    setMotor(CH_M1, out1);
+    setMotor(CH_M2, out2);
+    setMotor(CH_M3, out3);
+    setMotor(CH_M4, out4);
+  } else {
+    stopAllMotors();
+  }
+
+  // ------------------------------------------------------------
+  // SERIAL
+  // ------------------------------------------------------------
+  static unsigned long lastSerial = 0;
+  if (millis() - lastSerial >= 50) {
+    Serial.printf(
+      "Base:%3d | m1:%3d m2:%3d m3:%3d m4:%3d | pitch:%5.1f roll:%5.1f yaw:%5.1f gyro:%5.1f | Manpitch:%5.1f Manroll:%5.1f Manyaw:%5.1f | dist=%5u | armed:%d fs:%d\n",
+      motorBase, out1, out2, out3, out4,
+      pitch_f, roll_f, yaw_f, gyroZ_corr,
+      manualPitchCmd, manualRollCmd, manualYawCmd,
+      dist_mm, ActivarMotor ? 1 : 0, failsafeActive ? 1 : 0
+    );
+    lastSerial = millis();
+  }
+
+  // ------------------------------------------------------------
+  // TELEMETRIA A LA APP
+  // ------------------------------------------------------------
+  static unsigned long lastTelemetry = 0;
+  if (wsConnected && millis() - lastTelemetry >= TELEMETRY_INTERVAL_MS) {
+    char tel[320];
+    snprintf(
+      tel, sizeof(tel),
+      "TEL,%.2f,%.2f,%d,%d,%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%d,%d",
+      roll_f, pitch_f, motorBase,
+      out1, out2, out3, out4,
+      manualPitchCmd, manualRollCmd, manualYawCmd,
+      yaw_f, gyroZ_corr, dist_mm,
+      ActivarMotor ? 1 : 0,
+      failsafeActive ? 1 : 0
+    );
+
+    webSocket.sendTXT(wsClientNum, tel);
+    lastTelemetry = millis();
+  }
+
+  delay(1);
+}
+
